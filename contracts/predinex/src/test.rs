@@ -938,6 +938,9 @@ fn b4_invalid_winning_outcome_does_not_write_winning_outcome() {
 fn b5_settle_pool_winning_outcome_0_is_valid() {
     let t = setup();
     let pool_id = make_pool(&t);
+    // A participant is required for settlement (default min = 1).
+    t.client
+        .place_bet(&t.user, &pool_id, &0u32, &100i128, &None::<Address>);
     expire_pool(&t.env);
 
     // Must not panic
@@ -956,6 +959,9 @@ fn b5_settle_pool_winning_outcome_0_is_valid() {
 fn b6_settle_pool_winning_outcome_1_is_valid() {
     let t = setup();
     let pool_id = make_pool(&t);
+    // A participant is required for settlement (default min = 1).
+    t.client
+        .place_bet(&t.user, &pool_id, &1u32, &100i128, &None::<Address>);
     expire_pool(&t.env);
 
     // Must not panic
@@ -1342,6 +1348,10 @@ fn f1_delegated_settler_can_settle_after_expiry() {
     let settler = Address::generate(&t.env);
     t.client.assign_settler(&t.admin, &pool_id, &settler);
 
+    // A participant is required for settlement (default min = 1).
+    t.client
+        .place_bet(&t.user, &pool_id, &0u32, &100i128, &None::<Address>);
+
     expire_pool(&t.env);
 
     t.client.settle_pool(&settler, &pool_id, &0u32);
@@ -1384,6 +1394,10 @@ fn f3_non_creator_cannot_assign_settler() {
 fn f4_creator_can_settle_without_delegated_settler() {
     let t = setup();
     let pool_id = make_pool(&t);
+
+    // A participant is required for settlement (default min = 1).
+    t.client
+        .place_bet(&t.user, &pool_id, &1u32, &100i128, &None::<Address>);
 
     expire_pool(&t.env);
 
@@ -2059,6 +2073,610 @@ fn test_set_creation_fee_negative_rejected() {
     client.initialize(&token_id.address(), &treasury_recipient);
 
     client.set_creation_fee(&treasury_recipient, &-1);
+}
+
+/// An exempt creator is not charged the creation fee, even when one is set.
+#[test]
+fn test_creation_fee_exemption_skips_fee() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token::Client::new(&env, &token_id.address());
+
+    let treasury_recipient = Address::generate(&env);
+    client.initialize(&token_id.address(), &treasury_recipient);
+
+    let creation_fee = 500i128;
+    client.set_creation_fee(&treasury_recipient, &creation_fee);
+
+    let creator = Address::generate(&env);
+    // Exempt the creator. Note: no tokens are minted to the creator, so the
+    // pool can only be created if the fee transfer is genuinely skipped.
+    assert!(!client.is_creation_fee_exempt(&creator));
+    client.set_creation_fee_exemption(&treasury_recipient, &creator, &true);
+    assert!(client.is_creation_fee_exempt(&creator));
+
+    let initial_treasury_balance = token.balance(&treasury_recipient);
+
+    let pool_id = client.create_pool(
+        &creator,
+        &String::from_str(&env, "Exempt Pool"),
+        &String::from_str(&env, "Desc"),
+        &String::from_str(&env, "Yes"),
+        &String::from_str(&env, "No"),
+        &3600,
+    );
+
+    let pool = client.get_pool(&pool_id);
+    assert!(!pool.unwrap().settled);
+    // No fee moved to the treasury recipient.
+    assert_eq!(token.balance(&treasury_recipient), initial_treasury_balance);
+    assert_eq!(token.balance(&creator), 0);
+}
+
+/// Revoking an exemption restores normal fee charging.
+#[test]
+fn test_creation_fee_exemption_revoked_charges_again() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token::Client::new(&env, &token_id.address());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_id.address());
+
+    let treasury_recipient = Address::generate(&env);
+    client.initialize(&token_id.address(), &treasury_recipient);
+
+    let creation_fee = 500i128;
+    client.set_creation_fee(&treasury_recipient, &creation_fee);
+
+    let creator = Address::generate(&env);
+    client.set_creation_fee_exemption(&treasury_recipient, &creator, &true);
+    client.set_creation_fee_exemption(&treasury_recipient, &creator, &false);
+    assert!(!client.is_creation_fee_exempt(&creator));
+
+    token_admin_client.mint(&creator, &creation_fee);
+    let initial_treasury_balance = token.balance(&treasury_recipient);
+
+    client.create_pool(
+        &creator,
+        &String::from_str(&env, "Charged Pool"),
+        &String::from_str(&env, "Desc"),
+        &String::from_str(&env, "Yes"),
+        &String::from_str(&env, "No"),
+        &3600,
+    );
+
+    assert_eq!(
+        token.balance(&treasury_recipient),
+        initial_treasury_balance + creation_fee
+    );
+    assert_eq!(token.balance(&creator), 0);
+}
+
+/// Only the treasury recipient may set a creation-fee exemption.
+#[test]
+#[should_panic]
+fn test_set_creation_fee_exemption_unauthorized_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin);
+
+    let treasury_recipient = Address::generate(&env);
+    client.initialize(&token_id.address(), &treasury_recipient);
+
+    let attacker = Address::generate(&env);
+    let account = Address::generate(&env);
+    client.set_creation_fee_exemption(&attacker, &account, &true);
+}
+
+// ── Cumulative volume tracking ────────────────────────────────────────────────
+
+/// Per-pool and contract-wide volume increase by each bet amount, across
+/// multiple users and both outcomes, and persist unchanged through settlement
+/// and a winner claim.
+#[test]
+fn test_cumulative_volume_tracking() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_id.address());
+
+    client.initialize(&token_id.address(), &token_admin);
+
+    // Two independent pools so we can check contract-wide aggregation.
+    let creator = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    token_admin_client.mint(&alice, &1000);
+    token_admin_client.mint(&bob, &1000);
+
+    let pool_a = client.create_pool(
+        &creator,
+        &String::from_str(&env, "Pool A"),
+        &String::from_str(&env, "Desc"),
+        &String::from_str(&env, "Yes"),
+        &String::from_str(&env, "No"),
+        &3600,
+    );
+    let pool_b = client.create_pool(
+        &creator,
+        &String::from_str(&env, "Pool B"),
+        &String::from_str(&env, "Desc"),
+        &String::from_str(&env, "Yes"),
+        &String::from_str(&env, "No"),
+        &3600,
+    );
+
+    // New pools start at zero volume.
+    assert_eq!(client.get_pool_volume(&pool_a), 0);
+    assert_eq!(client.get_total_contract_volume(), 0);
+
+    // Multiple users, both outcomes, both pools.
+    client.place_bet(&alice, &pool_a, &0, &100, &None::<Address>);
+    client.place_bet(&bob, &pool_a, &1, &250, &None::<Address>);
+    client.place_bet(&alice, &pool_a, &1, &50, &None::<Address>); // same user, again
+    client.place_bet(&bob, &pool_b, &0, &400, &None::<Address>);
+
+    // Per-pool volume is the lifetime sum of bet amounts in that pool.
+    assert_eq!(client.get_pool_volume(&pool_a), 400);
+    assert_eq!(client.get_pool_volume(&pool_b), 400);
+    // The Pool struct exposes the same figure.
+    assert_eq!(client.get_pool(&pool_a).unwrap().cumulative_volume, 400);
+    // Contract-wide volume aggregates across all pools.
+    assert_eq!(client.get_total_contract_volume(), 800);
+
+    // Settle pool A and have a winner claim; volume must not change.
+    env.ledger().with_mut(|li| li.timestamp = 3601);
+    client.settle_pool(&creator, &pool_a, &0); // outcome 0 (alice's 100) wins
+    assert_eq!(client.get_pool_volume(&pool_a), 400);
+
+    client.claim_winnings(&alice, &pool_a);
+    assert_eq!(
+        client.get_pool_volume(&pool_a),
+        400,
+        "volume must persist through settlement and claims"
+    );
+    assert_eq!(client.get_total_contract_volume(), 800);
+}
+
+/// Unknown pools report zero volume rather than panicking.
+#[test]
+fn test_get_pool_volume_unknown_pool_is_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    client.initialize(&token_id.address(), &token_admin);
+
+    assert_eq!(client.get_pool_volume(&999), 0);
+    assert_eq!(client.get_total_contract_volume(), 0);
+}
+
+// ── Volume-based fee tiers ────────────────────────────────────────────────────
+
+/// Create a pool with a single winner and single loser of the given amounts,
+/// settle it, and return `(settlement_protocol_fee, winner_payout)`. Advances
+/// the ledger past the pool's expiry before settling.
+fn tiered_pool_fee_and_payout(
+    env: &Env,
+    client: &PredinexContractClient,
+    token_admin_client: &token::StellarAssetClient,
+    winner_amt: i128,
+    loser_amt: i128,
+) -> (i128, i128) {
+    let creator = Address::generate(env);
+    let winner = Address::generate(env);
+    let loser = Address::generate(env);
+    token_admin_client.mint(&winner, &winner_amt);
+    token_admin_client.mint(&loser, &loser_amt);
+
+    let now = env.ledger().timestamp();
+    let pool_id = client.create_pool(
+        &creator,
+        &String::from_str(env, "Tier Market"),
+        &String::from_str(env, "Desc"),
+        &String::from_str(env, "Yes"),
+        &String::from_str(env, "No"),
+        &3600,
+    );
+    client.place_bet(&winner, &pool_id, &0, &winner_amt, &None::<Address>);
+    client.place_bet(&loser, &pool_id, &1, &loser_amt, &None::<Address>);
+
+    env.ledger().with_mut(|li| li.timestamp = now + 3601);
+    client.settle_pool(&creator, &pool_id, &0);
+
+    let fee = client
+        .get_pool_protocol_revenue(&pool_id)
+        .settlement_protocol_fee;
+    let payout = client.claim_winnings(&winner, &pool_id);
+    (fee, payout)
+}
+
+/// Below the first tier → flat default fee; within a tier → that tier's fee;
+/// above the highest tier → the highest tier's fee. The settlement fee and the
+/// winner payout both reflect the resolved tier.
+#[test]
+fn test_volume_fee_tiers_resolution() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_id.address());
+    // Treasury recipient == token_admin (authorised to configure tiers).
+    client.initialize(&token_id.address(), &token_admin);
+
+    // Default protocol fee is 200 bps (2%). Two tiers below that.
+    let tiers = soroban_sdk::Vec::from_array(
+        &env,
+        [
+            FeeTier {
+                volume_threshold: 1000,
+                fee_bps: 100,
+            }, // >= 1000 → 1%
+            FeeTier {
+                volume_threshold: 5000,
+                fee_bps: 50,
+            }, // >= 5000 → 0.5%
+        ],
+    );
+    client.set_volume_fee_tiers(&token_admin, &tiers);
+
+    // Volume 500 (below first tier) → default 2% → fee 10, payout 490.
+    let (fee, payout) = tiered_pool_fee_and_payout(&env, &client, &token_admin_client, 300, 200);
+    assert_eq!(fee, 10, "below first tier uses default fee");
+    assert_eq!(payout, 490);
+
+    // Volume 2000 (within first tier) → 1% → fee 20, payout 1980.
+    let (fee, payout) = tiered_pool_fee_and_payout(&env, &client, &token_admin_client, 1200, 800);
+    assert_eq!(fee, 20, "within tier uses tier fee");
+    assert_eq!(payout, 1980);
+
+    // Volume 6000 (above highest tier) → 0.5% → fee 30, payout 5970.
+    let (fee, payout) = tiered_pool_fee_and_payout(&env, &client, &token_admin_client, 4000, 2000);
+    assert_eq!(fee, 30, "above highest tier uses highest tier fee");
+    assert_eq!(payout, 5970);
+}
+
+/// With no tiers configured the contract uses the flat protocol fee (backward
+/// compatible), even when a tier-capable build is deployed.
+#[test]
+fn test_volume_fee_tiers_unconfigured_is_flat_fee() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_id.address());
+    client.initialize(&token_id.address(), &token_admin);
+
+    assert!(client.get_volume_fee_tiers().is_empty());
+
+    // Volume 6000, no tiers → flat 2% → fee 120, payout 5880.
+    let (fee, payout) = tiered_pool_fee_and_payout(&env, &client, &token_admin_client, 4000, 2000);
+    assert_eq!(fee, 120);
+    assert_eq!(payout, 5880);
+}
+
+/// Setting tiers emits a `fee_tiers_updated` event and an empty vector clears them.
+#[test]
+fn test_set_volume_fee_tiers_event_and_clear() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    client.initialize(&token_id.address(), &token_admin);
+
+    let tiers = soroban_sdk::Vec::from_array(
+        &env,
+        [FeeTier {
+            volume_threshold: 1000,
+            fee_bps: 100,
+        }],
+    );
+    client.set_volume_fee_tiers(&token_admin, &tiers);
+
+    // The event emitted by set_volume_fee_tiers is fee_tiers_updated. Read it
+    // before any further contract call (the event buffer reflects the most
+    // recent invocation only).
+    let events = env.events().all();
+    let last_event = events.last().expect("must emit an event");
+    let topics = last_event.1;
+    let name: soroban_sdk::Symbol = soroban_sdk::FromVal::from_val(&env, &topics.get(0).unwrap());
+    assert_eq!(name, soroban_sdk::Symbol::new(&env, "fee_tiers_updated"));
+
+    assert_eq!(client.get_volume_fee_tiers().len(), 1);
+
+    // Empty vector clears configured tiers.
+    let empty = soroban_sdk::Vec::<FeeTier>::new(&env);
+    client.set_volume_fee_tiers(&token_admin, &empty);
+    assert!(client.get_volume_fee_tiers().is_empty());
+}
+
+/// More than MAX_FEE_TIERS (5) tiers is rejected.
+#[test]
+#[should_panic]
+fn test_set_volume_fee_tiers_too_many_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    client.initialize(&token_id.address(), &token_admin);
+
+    let tiers = soroban_sdk::Vec::from_array(
+        &env,
+        [
+            FeeTier {
+                volume_threshold: 100,
+                fee_bps: 90,
+            },
+            FeeTier {
+                volume_threshold: 200,
+                fee_bps: 80,
+            },
+            FeeTier {
+                volume_threshold: 300,
+                fee_bps: 70,
+            },
+            FeeTier {
+                volume_threshold: 400,
+                fee_bps: 60,
+            },
+            FeeTier {
+                volume_threshold: 500,
+                fee_bps: 50,
+            },
+            FeeTier {
+                volume_threshold: 600,
+                fee_bps: 40,
+            },
+        ],
+    );
+    client.set_volume_fee_tiers(&token_admin, &tiers);
+}
+
+/// Non-ascending thresholds are rejected.
+#[test]
+#[should_panic]
+fn test_set_volume_fee_tiers_non_ascending_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    client.initialize(&token_id.address(), &token_admin);
+
+    let tiers = soroban_sdk::Vec::from_array(
+        &env,
+        [
+            FeeTier {
+                volume_threshold: 5000,
+                fee_bps: 50,
+            },
+            FeeTier {
+                volume_threshold: 1000,
+                fee_bps: 100,
+            },
+        ],
+    );
+    client.set_volume_fee_tiers(&token_admin, &tiers);
+}
+
+/// A fee_bps above the protocol maximum is rejected.
+#[test]
+#[should_panic]
+fn test_set_volume_fee_tiers_fee_out_of_bounds_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    client.initialize(&token_id.address(), &token_admin);
+
+    let tiers = soroban_sdk::Vec::from_array(
+        &env,
+        [FeeTier {
+            volume_threshold: 1000,
+            fee_bps: 1001,
+        }],
+    );
+    client.set_volume_fee_tiers(&token_admin, &tiers);
+}
+
+/// Only the treasury recipient may configure fee tiers.
+#[test]
+#[should_panic]
+fn test_set_volume_fee_tiers_unauthorized_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    client.initialize(&token_id.address(), &token_admin);
+
+    let attacker = Address::generate(&env);
+    let tiers = soroban_sdk::Vec::from_array(
+        &env,
+        [FeeTier {
+            volume_threshold: 1000,
+            fee_bps: 100,
+        }],
+    );
+    client.set_volume_fee_tiers(&attacker, &tiers);
+}
+
+// ── Minimum participants for settlement ───────────────────────────────────────
+
+/// Build a clean contract and return (env, client, treasury_recipient, mint).
+fn min_participants_setup() -> (
+    Env,
+    PredinexContractClient<'static>,
+    Address,
+    token::StellarAssetClient<'static>,
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_id.address());
+    client.initialize(&token_id.address(), &token_admin);
+
+    let client: PredinexContractClient<'static> = unsafe { core::mem::transmute(client) };
+    let token_admin_client: token::StellarAssetClient<'static> =
+        unsafe { core::mem::transmute(token_admin_client) };
+    (env, client, token_admin, token_admin_client)
+}
+
+/// Default threshold is 1 and is configurable; the setter persists.
+#[test]
+fn test_min_settlement_participants_default_and_set() {
+    let (_env, client, treasury, _mint) = min_participants_setup();
+    assert_eq!(client.get_min_settlement_participants(), 1);
+
+    client.set_min_settlement_participants(&treasury, &3);
+    assert_eq!(client.get_min_settlement_participants(), 3);
+}
+
+/// A pool with fewer participants than the threshold cannot be settled, and the
+/// pool stays Open after the rejected attempt.
+#[test]
+fn test_settle_below_min_participants_rejected() {
+    let (env, client, treasury, mint) = min_participants_setup();
+    client.set_min_settlement_participants(&treasury, &2);
+
+    let creator = Address::generate(&env);
+    let user = Address::generate(&env);
+    mint.mint(&user, &1000);
+
+    let pool_id = client.create_pool(
+        &creator,
+        &String::from_str(&env, "Thin Market"),
+        &String::from_str(&env, "Desc"),
+        &String::from_str(&env, "Yes"),
+        &String::from_str(&env, "No"),
+        &3600,
+    );
+    // Only one participant — below the threshold of 2.
+    client.place_bet(&user, &pool_id, &0, &100, &None::<Address>);
+
+    env.ledger().with_mut(|li| li.timestamp = 3601);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.settle_pool(&creator, &pool_id, &0);
+    }));
+    assert!(
+        result.is_err(),
+        "settlement below threshold must be rejected"
+    );
+
+    let pool = client.get_pool(&pool_id).expect("pool must still exist");
+    assert_eq!(pool.status, PoolStatus::Open, "pool must remain Open");
+}
+
+/// Once the participant count reaches the threshold, settlement succeeds.
+#[test]
+fn test_settle_meets_min_participants_succeeds() {
+    let (env, client, treasury, mint) = min_participants_setup();
+    client.set_min_settlement_participants(&treasury, &2);
+
+    let creator = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    mint.mint(&alice, &1000);
+    mint.mint(&bob, &1000);
+
+    let pool_id = client.create_pool(
+        &creator,
+        &String::from_str(&env, "Market"),
+        &String::from_str(&env, "Desc"),
+        &String::from_str(&env, "Yes"),
+        &String::from_str(&env, "No"),
+        &3600,
+    );
+    // Two distinct participants meet the threshold of 2.
+    client.place_bet(&alice, &pool_id, &0, &100, &None::<Address>);
+    client.place_bet(&bob, &pool_id, &1, &100, &None::<Address>);
+
+    env.ledger().with_mut(|li| li.timestamp = 3601);
+    client.settle_pool(&creator, &pool_id, &0);
+
+    let pool = client.get_pool(&pool_id).expect("pool must exist");
+    assert_eq!(pool.status, PoolStatus::Settled(0));
+}
+
+/// Setting the threshold to 0 disables the check (empty pools may settle).
+#[test]
+fn test_min_settlement_participants_zero_disables_check() {
+    let (env, client, treasury, _mint) = min_participants_setup();
+    client.set_min_settlement_participants(&treasury, &0);
+
+    let creator = Address::generate(&env);
+    let pool_id = client.create_pool(
+        &creator,
+        &String::from_str(&env, "Empty Market"),
+        &String::from_str(&env, "Desc"),
+        &String::from_str(&env, "Yes"),
+        &String::from_str(&env, "No"),
+        &3600,
+    );
+
+    env.ledger().with_mut(|li| li.timestamp = 3601);
+    client.settle_pool(&creator, &pool_id, &0);
+
+    let pool = client.get_pool(&pool_id).expect("pool must exist");
+    assert_eq!(pool.status, PoolStatus::Settled(0));
+}
+
+/// Only the treasury recipient may change the threshold.
+#[test]
+#[should_panic]
+fn test_set_min_settlement_participants_unauthorized_rejected() {
+    let (env, client, _treasury, _mint) = min_participants_setup();
+    let attacker = Address::generate(&env);
+    client.set_min_settlement_participants(&attacker, &5);
 }
 
 // ── Issue #173: get_claim_status read method ──────────────────────────────────
@@ -3540,7 +4158,11 @@ fn test_list_pools_partial_page_at_boundary() {
     make_pool(&t);
     // start=3, limit=10 — only pool 3 remains.
     let result = t.client.list_pools(&3, &10);
-    assert_eq!(result.len(), 1, "partial page at boundary must return remaining pools");
+    assert_eq!(
+        result.len(),
+        1,
+        "partial page at boundary must return remaining pools"
+    );
 }
 
 #[test]
@@ -3578,9 +4200,18 @@ fn test_list_pools_insertion_order_preserved() {
     let result = t.client.list_pools(&1, &3);
     assert_eq!(result.len(), 3);
     // Pools are returned in ascending ID order (insertion order).
-    assert_eq!(result.get(0).unwrap().creator, t.client.get_pool(&id1).unwrap().creator);
-    assert_eq!(result.get(1).unwrap().creator, t.client.get_pool(&id2).unwrap().creator);
-    assert_eq!(result.get(2).unwrap().creator, t.client.get_pool(&id3).unwrap().creator);
+    assert_eq!(
+        result.get(0).unwrap().creator,
+        t.client.get_pool(&id1).unwrap().creator
+    );
+    assert_eq!(
+        result.get(1).unwrap().creator,
+        t.client.get_pool(&id2).unwrap().creator
+    );
+    assert_eq!(
+        result.get(2).unwrap().creator,
+        t.client.get_pool(&id3).unwrap().creator
+    );
 }
 
 #[test]
@@ -3642,7 +4273,10 @@ fn test_claim_expired_no_fee_deducted() {
 
     let refund = t.client.claim_expired(&t.user, &pool_id);
     // Full amount back — no protocol fee on expired refunds.
-    assert_eq!(refund, 500i128, "no fee must be deducted from expired refund");
+    assert_eq!(
+        refund, 500i128,
+        "no fee must be deducted from expired refund"
+    );
 }
 
 #[test]
@@ -3725,5 +4359,8 @@ fn test_claim_expired_removes_bet_record() {
 
     // Bet record must be gone after claim.
     let bet = t.client.get_user_bet(&pool_id, &t.user);
-    assert!(bet.is_none(), "bet record must be removed after claim_expired");
+    assert!(
+        bet.is_none(),
+        "bet record must be removed after claim_expired"
+    );
 }

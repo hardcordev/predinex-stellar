@@ -77,6 +77,10 @@ pub enum DataKey {
     /// #179 — per-pool creation fee in stroops. Set by the admin via
     /// `set_creation_fee`; defaults to 0 (no fee) when absent.
     CreationFee,
+    /// Per-address creation-fee exemption flag. When present and `true`, the
+    /// account is not charged the creation fee in `create_pool_internal`. Set
+    /// by the treasury recipient via `set_creation_fee_exemption`.
+    CreationFeeExempt(Address),
     /// #167 — protocol fee in basis points. Set by the treasury recipient via
     /// `set_protocol_fee`; defaults to 200 (2%) when absent.
     ProtocolFee,
@@ -120,6 +124,20 @@ pub enum DataKey {
     TreasuryWithdrawalWindowSecs,
     /// #363 — Current treasury withdrawal rate-limit usage state.
     TreasuryWithdrawalState,
+    /// Contract-wide cumulative betting volume across all pools, incremented by
+    /// the bet amount on every `place_bet`. Read via `get_total_contract_volume`.
+    TotalContractVolume,
+    /// Optional volume-based protocol fee tiers (`Vec<FeeTier>`). When absent or
+    /// empty, the flat `ProtocolFee` applies. Set via `set_volume_fee_tiers`.
+    VolumeFeeTiers,
+    /// Protocol fee in basis points fixed for a pool at settlement when fee
+    /// tiers are configured. Read by claim/preview so the deducted fee matches
+    /// the tier resolved at settlement. Absent for pools settled under the flat
+    /// fee (those fall back to the live `ProtocolFee`).
+    PoolFeeBps(u32),
+    /// Minimum number of participants a pool must have before it can be settled.
+    /// Set by the treasury recipient; defaults to `DEFAULT_MIN_SETTLEMENT_PARTICIPANTS`.
+    MinSettlementParticipants,
 }
 
 // #189 — TTL bump policy for persistent storage entries.
@@ -142,6 +160,14 @@ const POOL_BUMP_THRESHOLD: u32 = LEDGERS_PER_DAY * 25; // trigger bump when < 25
 const PROTOCOL_FEE_MIN_BPS: u32 = 0;
 const PROTOCOL_FEE_MAX_BPS: u32 = 1000;
 const PROTOCOL_FEE_DEFAULT_BPS: u32 = 200;
+
+/// Maximum number of volume-based fee tiers accepted by `set_volume_fee_tiers`.
+const MAX_FEE_TIERS: u32 = 5;
+
+/// Default minimum participant count required to settle a pool. A value of 1
+/// preserves the historical behaviour of allowing any pool with at least one
+/// bettor to settle while blocking settlement of completely empty pools.
+const DEFAULT_MIN_SETTLEMENT_PARTICIPANTS: u32 = 1;
 
 /// #151 — Minimum pool lifetime in seconds (matches `web/docs/POOL_DURATION.md`).
 const MIN_POOL_DURATION_SECS: u64 = 300;
@@ -200,7 +226,6 @@ pub enum ContractError {
     PoolIsDisputed = 17,
     PoolNotSettled = 18,
     PoolNotFrozenOrDisputed = 19,
-    PoolHasBets = 20,
     PoolCannotBeVoided = 21,
     PoolMustBeSettledToDispute = 22,
     NoBetFound = 23,
@@ -238,6 +263,9 @@ pub enum ContractError {
     RateLimitExceeded = 49,
     /// #350 — Operation blocked because contract is paused.
     ContractPaused = 50,
+    /// Settlement attempted on a pool with fewer participants than the
+    /// configured `MinSettlementParticipants` threshold.
+    InsufficientParticipants = 51,
 }
 
 /// #176 — Settlement source tag indicating who initiated pool settlement.
@@ -300,6 +328,12 @@ pub struct Pool {
     pub expiry: u64,
     /// Current operational status of the pool. Defaults to `Open`.
     pub status: PoolStatus,
+    /// Cumulative betting volume routed through this pool, incremented by the
+    /// bet amount on every `place_bet`. Unlike `total_a`/`total_b` (which an
+    /// indexer could net out by outcome), this is a monotonically increasing
+    /// lifetime figure that persists unchanged through settlement and claims —
+    /// an on-chain source for analytics displays without an off-chain indexer.
+    pub cumulative_volume: i128,
 }
 
 #[derive(Clone)]
@@ -380,6 +414,20 @@ pub struct CircuitBreakerConfig {
 pub struct RateLimitConfig {
     pub max_bets_per_window: u32,
     pub window_secs: u64,
+}
+
+/// A single volume-based protocol fee tier.
+///
+/// When a pool's total volume at settlement is at least `volume_threshold`, the
+/// associated `fee_bps` may apply (the highest matching tier wins). Pools whose
+/// volume is below the first tier fall back to the flat default protocol fee.
+#[derive(Clone, PartialEq, Debug)]
+#[contracttype]
+pub struct FeeTier {
+    /// Minimum total pool volume (inclusive) for this tier to apply.
+    pub volume_threshold: i128,
+    /// Protocol fee in basis points charged when this tier is the match.
+    pub fee_bps: u32,
 }
 
 #[derive(Clone)]
@@ -708,6 +756,55 @@ impl PredinexContract {
             .unwrap_or(0)
     }
 
+    /// Grant or revoke a per-address exemption from the creation fee.
+    ///
+    /// Only the treasury recipient may call this (same permission model as
+    /// `set_creation_fee`). When an account is exempt, `create_pool` /
+    /// `create_multi_outcome_pool` / `schedule_pool` will not charge the
+    /// configured creation fee for that creator. Passing `exempt = false`
+    /// removes the exemption so the account is charged normally again.
+    ///
+    /// A `creation_fee_exemption_set` event is emitted with the affected
+    /// account and the new flag so indexers can track exemptions.
+    pub fn set_creation_fee_exemption(
+        env: Env,
+        caller: Address,
+        account: Address,
+        exempt: bool,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::require_treasury_recipient(&env, &caller)?;
+
+        let key = DataKey::CreationFeeExempt(account.clone());
+        if exempt {
+            env.storage().persistent().set(&key, &true);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, POOL_BUMP_THRESHOLD, POOL_BUMP_TARGET);
+        } else {
+            // Removing the entry keeps storage tidy and is equivalent to the
+            // default (not exempt) for reads.
+            env.storage().persistent().remove(&key);
+        }
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "creation_fee_exemption_set"),
+                event_version(&env),
+            ),
+            (account, exempt),
+        );
+        Ok(())
+    }
+
+    /// Return whether `account` is currently exempt from the creation fee.
+    pub fn is_creation_fee_exempt(env: Env, account: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::CreationFeeExempt(account))
+            .unwrap_or(false)
+    }
+
     /// #167 — Set the protocol fee in basis points.
     ///
     /// Only the treasury recipient may call this. The fee must be within
@@ -757,6 +854,120 @@ impl PredinexContract {
             .persistent()
             .get::<_, u32>(&DataKey::ProtocolFee)
             .unwrap_or(PROTOCOL_FEE_DEFAULT_BPS)
+    }
+
+    /// Configure volume-based protocol fee tiers.
+    ///
+    /// Tiers let larger markets pay a reduced (or otherwise different) fee than
+    /// the flat protocol fee. Each entry is a `(volume_threshold, fee_bps)`
+    /// pair; at settlement the contract picks the highest tier whose
+    /// `volume_threshold` is `<=` the pool's total volume. Pools below the first
+    /// tier — and all pools when no tiers are configured — use the flat
+    /// `ProtocolFee`, so the feature is fully backward compatible.
+    ///
+    /// Only the treasury recipient may call this. Passing an empty vector clears
+    /// any configured tiers and restores flat-fee behaviour.
+    ///
+    /// Validation (rejected with `FeeOutOfBounds`):
+    /// * at most `MAX_FEE_TIERS` (5) tiers
+    /// * every `volume_threshold >= 0`
+    /// * strictly ascending `volume_threshold` (no duplicates, defined order)
+    /// * every `fee_bps` within `[PROTOCOL_FEE_MIN_BPS, PROTOCOL_FEE_MAX_BPS]`
+    ///
+    /// Emits `fee_tiers_updated` with the number of tiers now configured.
+    pub fn set_volume_fee_tiers(
+        env: Env,
+        caller: Address,
+        tiers: Vec<FeeTier>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::require_treasury_recipient(&env, &caller)?;
+
+        if tiers.len() > MAX_FEE_TIERS {
+            return Err(ContractError::FeeOutOfBounds);
+        }
+
+        let mut prev_threshold: Option<i128> = None;
+        for i in 0..tiers.len() {
+            let tier = tiers.get(i).unwrap();
+            if tier.volume_threshold < 0 {
+                return Err(ContractError::FeeOutOfBounds);
+            }
+            if !(PROTOCOL_FEE_MIN_BPS..=PROTOCOL_FEE_MAX_BPS).contains(&tier.fee_bps) {
+                return Err(ContractError::FeeOutOfBounds);
+            }
+            if let Some(prev) = prev_threshold {
+                if tier.volume_threshold <= prev {
+                    return Err(ContractError::FeeOutOfBounds);
+                }
+            }
+            prev_threshold = Some(tier.volume_threshold);
+        }
+
+        if tiers.is_empty() {
+            env.storage().persistent().remove(&DataKey::VolumeFeeTiers);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::VolumeFeeTiers, &tiers);
+            env.storage().persistent().extend_ttl(
+                &DataKey::VolumeFeeTiers,
+                POOL_BUMP_THRESHOLD,
+                POOL_BUMP_TARGET,
+            );
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "fee_tiers_updated"), event_version(&env)),
+            tiers.len(),
+        );
+        Ok(())
+    }
+
+    /// Return the configured volume fee tiers (empty when none are set).
+    pub fn get_volume_fee_tiers(env: Env) -> Vec<FeeTier> {
+        env.storage()
+            .persistent()
+            .get::<_, Vec<FeeTier>>(&DataKey::VolumeFeeTiers)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Resolve the protocol fee (bps) that applies to a pool whose total volume
+    /// is `volume`, honouring configured fee tiers.
+    ///
+    /// Returns the flat `ProtocolFee` when no tiers are configured or when the
+    /// volume is below the first tier; otherwise the `fee_bps` of the highest
+    /// tier whose threshold is `<= volume`.
+    fn resolve_fee_bps_for_volume(env: &Env, volume: i128) -> u32 {
+        let tiers = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<FeeTier>>(&DataKey::VolumeFeeTiers)
+            .unwrap_or_else(|| Vec::new(env));
+
+        // Tiers are stored in strictly ascending threshold order, so the last
+        // tier whose threshold is satisfied is the highest matching tier.
+        let mut matched: Option<u32> = None;
+        for i in 0..tiers.len() {
+            let tier = tiers.get(i).unwrap();
+            if volume >= tier.volume_threshold {
+                matched = Some(tier.fee_bps);
+            } else {
+                break;
+            }
+        }
+
+        matched.unwrap_or_else(|| Self::get_protocol_fee(env.clone()))
+    }
+
+    /// Return the protocol fee (bps) used for a settled pool's payouts: the
+    /// value fixed at settlement when fee tiers applied, otherwise the live flat
+    /// `ProtocolFee` (preserving pre-tier behaviour for untiered pools).
+    fn pool_effective_fee_bps(env: &Env, pool_id: u32) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::PoolFeeBps(pool_id))
+            .unwrap_or_else(|| Self::get_protocol_fee(env.clone())) as i128
     }
 
     /// Set per-pool bet limits.
@@ -1258,7 +1469,15 @@ impl PredinexContract {
             .get::<_, i128>(&DataKey::CreationFee)
             .unwrap_or(0);
 
-        if creation_fee > 0 {
+        // Exempt creators (e.g. partners, the treasury, or promotional
+        // accounts) skip the creation fee entirely.
+        let fee_exempt = env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::CreationFeeExempt(creator.clone()))
+            .unwrap_or(false);
+
+        if creation_fee > 0 && !fee_exempt {
             let token_address: Address = env
                 .storage()
                 .persistent()
@@ -1294,6 +1513,7 @@ impl PredinexContract {
             created_at,
             expiry,
             status,
+            cumulative_volume: 0,
         };
 
         let mut totals = Vec::new(env);
@@ -1719,6 +1939,24 @@ impl PredinexContract {
                 .ok_or(ContractError::PoolTotalOverflow)?;
         }
 
+        // Track cumulative betting volume for on-chain analytics. This figure
+        // only ever grows and is never reset by settlement or claims, so it
+        // diverges from total_a/total_b once winners withdraw.
+        pool.cumulative_volume = pool
+            .cumulative_volume
+            .checked_add(amount)
+            .ok_or(ContractError::PoolTotalOverflow)?;
+        let total_contract_volume: i128 = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&DataKey::TotalContractVolume)
+            .unwrap_or(0)
+            .checked_add(amount)
+            .ok_or(ContractError::PoolTotalOverflow)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalContractVolume, &total_contract_volume);
+
         let mut user_bet = env
             .storage()
             .persistent()
@@ -1976,6 +2214,45 @@ impl PredinexContract {
             .get(&DataKey::DelegatedSettler(pool_id))
     }
 
+    /// Set the minimum number of participants a pool must have before it can be
+    /// settled. A creator could otherwise settle a market with a single
+    /// participant (or none); requiring a threshold prevents unfair early
+    /// settlement of thin markets.
+    ///
+    /// Only the treasury recipient may call this. The value persists and applies
+    /// to all future `settle_pool` / `settle_pools` calls. Pass 0 to disable the
+    /// check entirely. Emits `min_settlement_participants_set`.
+    pub fn set_min_settlement_participants(
+        env: Env,
+        caller: Address,
+        min_participants: u32,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::require_treasury_recipient(&env, &caller)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinSettlementParticipants, &min_participants);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "min_settlement_participants_set"),
+                event_version(&env),
+            ),
+            min_participants,
+        );
+        Ok(())
+    }
+
+    /// Return the configured minimum participant count required to settle a pool
+    /// (defaults to `DEFAULT_MIN_SETTLEMENT_PARTICIPANTS`).
+    pub fn get_min_settlement_participants(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::MinSettlementParticipants)
+            .unwrap_or(DEFAULT_MIN_SETTLEMENT_PARTICIPANTS)
+    }
+
     /// Internal settlement logic shared by `settle_pool` and `settle_pools`.
     /// Does NOT call `require_auth` — the caller must authenticate before calling.
     fn settle_single_pool(
@@ -2019,6 +2296,13 @@ impl PredinexContract {
             return Err(ContractError::PoolNotExpired);
         }
 
+        // Block settlement of pools that have not reached the configured minimum
+        // participant count, preventing unfair early settlement of thin markets.
+        let min_participants = Self::get_min_settlement_participants(env.clone());
+        if pool.participant_count < min_participants {
+            return Err(ContractError::InsufficientParticipants);
+        }
+
         let outcomes = Self::read_outcomes(env, pool_id, &pool);
         if winning_outcome >= outcomes.len() {
             return Err(ContractError::InvalidOutcome);
@@ -2033,8 +2317,21 @@ impl PredinexContract {
         let totals = Self::read_outcome_totals(env, pool_id, &pool);
         let winning_side_total = totals.get(winning_outcome).unwrap();
         let total_pool_volume = Self::sum_totals(&totals)?;
-        let fee_bps = Self::get_protocol_fee(env.clone()) as i128;
-        let fee_amount = (total_pool_volume * fee_bps) / 10000;
+        // Resolve the fee against any configured volume tiers (flat fee when
+        // none apply). When tiers are configured we lock the resolved bps for
+        // this pool so winner claims deduct exactly the fee fixed here.
+        let fee_bps = Self::resolve_fee_bps_for_volume(env, total_pool_volume);
+        let fee_amount = (total_pool_volume * fee_bps as i128) / 10000;
+        if env.storage().persistent().has(&DataKey::VolumeFeeTiers) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::PoolFeeBps(pool_id), &fee_bps);
+            env.storage().persistent().extend_ttl(
+                &DataKey::PoolFeeBps(pool_id),
+                POOL_BUMP_THRESHOLD,
+                POOL_BUMP_TARGET,
+            );
+        }
 
         env.storage()
             .persistent()
@@ -2385,7 +2682,7 @@ impl PredinexContract {
         let pool_winning_total = totals.get(winning_outcome).unwrap();
         let total_pool_balance = Self::sum_totals(&totals)?;
 
-        let fee_bps = Self::get_protocol_fee(env.clone()) as i128;
+        let fee_bps = Self::pool_effective_fee_bps(env, pool_id);
         let fee = (total_pool_balance * fee_bps) / 10000;
         let net_pool_balance = total_pool_balance - fee;
 
@@ -2733,7 +3030,7 @@ impl PredinexContract {
                 Ok(total) => total,
                 Err(_) => continue,
             };
-            let fee_bps = Self::get_protocol_fee(env.clone()) as i128;
+            let fee_bps = Self::pool_effective_fee_bps(&env, pool_id);
             let fee = (total_pool_balance * fee_bps) / 10000;
             let net_pool_balance = total_pool_balance - fee;
             let winnings = (user_winning_bet * net_pool_balance) / pool_winning_total;
@@ -3946,7 +4243,7 @@ impl PredinexContract {
             Ok(total) => total,
             Err(_) => return ClaimPreview::Unclaimable,
         };
-        let fee_bps = Self::get_protocol_fee(env.clone()) as i128;
+        let fee_bps = Self::pool_effective_fee_bps(&env, pool_id);
         let fee = (total_pool_balance * fee_bps) / 10000;
         let net_pool_balance = total_pool_balance - fee;
         let amount = (user_winning_bet * net_pool_balance) / pool_winning_total;
@@ -3959,6 +4256,29 @@ impl PredinexContract {
             .persistent()
             .get::<_, Pool>(&DataKey::Pool(pool_id))
             .map(|p| p.participant_count)
+            .unwrap_or(0)
+    }
+
+    /// Return the cumulative betting volume for a single pool.
+    ///
+    /// This is the lifetime sum of every `place_bet` amount on the pool and is
+    /// not reduced by settlement or claims. Returns 0 for unknown pools.
+    pub fn get_pool_volume(env: Env, pool_id: u32) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<_, Pool>(&DataKey::Pool(pool_id))
+            .map(|p| p.cumulative_volume)
+            .unwrap_or(0)
+    }
+
+    /// Return the contract-wide cumulative betting volume across all pools.
+    ///
+    /// Incremented by every `place_bet` and never decremented, providing an
+    /// on-chain total-volume figure for frontends without an off-chain indexer.
+    pub fn get_total_contract_volume(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<_, i128>(&DataKey::TotalContractVolume)
             .unwrap_or(0)
     }
 }
